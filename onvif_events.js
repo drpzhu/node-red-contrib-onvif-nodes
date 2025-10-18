@@ -146,13 +146,9 @@
                             }
                         };
 
-                        // create the PullPoint subscription with 5-minute timeout
-                        // C560 needs explicit termination time to avoid rapid expiry
-                        const subscriptionOptions = {
-                            InitialTerminationTime: 'PT5M'  // 5 minutes in ISO 8601 duration format
-                        };
-                        
-                        node.deviceConfig.cam.createPullPointSubscription(subscriptionOptions, function (err, subscription) {
+                        // create the PullPoint subscription
+                        // Try with callback only first (standard approach)
+                        node.deviceConfig.cam.createPullPointSubscription(function (err, subscription, xml) {
                             if (err) {
                                 node.error("Failed to create pull point subscription: " + err);
                                 return;
@@ -278,19 +274,17 @@
                                 });
                             }
 
-                            // renew timer - very aggressive for C560 (every 2 minutes, well before 5-min expiry)
+                            // renew timer - frequent renewal for C560 (every 60 seconds)
                             if (subscription && typeof subscription.renew === "function") {
                                 node.renewalTimer = setInterval(() => {
                                     if (!node.stopPulling && node.subscription) {
-                                        subscription.renew('PT5M', (err) => {  // Renew for another 5 minutes
+                                        subscription.renew((err) => {
                                             if (err) {
-                                                node.warn("Renewal failed: " + err + " - will recreate if needed");
-                                            } else {
-                                                node.warn("Subscription renewed for 5 more minutes");
+                                                node.warn("Renewal failed: " + err);
                                             }
                                         });
                                     }
-                                }, 120000); // 2 minutes (120 seconds)
+                                }, 60000); // 60 seconds - frequent renewal for C560
                             }
 
                             poll();
