@@ -145,93 +145,93 @@ module.exports = function (RED) {
 
     // ---- Start (PullPoint) ----
     function startListening() {
-      if (started) return; // idempotent
-      if (!node.deviceConfig || !node.deviceConfig.cam) {
+    if (started) return; // idempotent
+
+    // Camera instance not ready yet? show status and retry in 1s
+    if (!node.deviceConfig || !node.deviceConfig.cam) {
         node.status({ fill: "yellow", shape: "ring", text: "waiting for camera" });
+        // optional breadcrumb
+        node.warn("onvif-events: deviceConfig=" + !!node.deviceConfig + " cam=" + (node.deviceConfig && !!node.deviceConfig.cam));
+        setTimeout(() => { if (!started) startListening(); }, 1000);
         return;
-      }
-      if (node.subscriptionMode !== "pull") {
+    }
+    // This build only implements PullPoint
+    if (node.subscriptionMode !== "pull") {
         node.status({ fill: "red", shape: "ring", text: "only pull mode supported in this build" });
         return;
-      }
+    }
 
-      started = true;
-      node.stopPulling = false;
+    started = true;
+    node.stopPulling = false;
 
-      // Create PullPoint subscription
-      node.deviceConfig.cam.createPullPointSubscription(function (err, subscription /*, terminationTime */) {
+    // Create PullPoint subscription
+    node.deviceConfig.cam.createPullPointSubscription(function (err, subscription /*, terminationTime */) {
         if (err) {
-          started = false;
-          node.status({ fill: "red", shape: "ring", text: ("pullpoint failed: " + String(err)).slice(0, 60) });
-          return;
+        started = false;
+        node.status({ fill: "red", shape: "ring", text: ("pullpoint failed: " + String(err)).slice(0, 60) });
+        return;
         }
 
         node.subscription = subscription;
         node.errorCount = 0;
 
-        // Find a usable pullMessages function (subscription vs cam)
+        // Pick a working pullMessages (subscription or cam) for onvif@0.6.x
         const pullFn =
-          (subscription && typeof subscription.pullMessages === "function" && subscription.pullMessages.bind(subscription)) ||
-          (subscription && typeof subscription.PullMessages === "function" && subscription.PullMessages.bind(subscription)) ||
-          (node.deviceConfig.cam && typeof node.deviceConfig.cam.pullMessages === "function" && node.deviceConfig.cam.pullMessages.bind(node.deviceConfig.cam));
+        (subscription && typeof subscription.pullMessages === "function" && subscription.pullMessages.bind(subscription)) ||
+        (subscription && typeof subscription.PullMessages === "function" && subscription.PullMessages.bind(subscription)) ||
+        (node.deviceConfig.cam && typeof node.deviceConfig.cam.pullMessages === "function" && node.deviceConfig.cam.pullMessages.bind(node.deviceConfig.cam));
 
         if (!pullFn) {
-          started = false;
-          node.error("No pullMessages on subscription/cam (check onvif version).");
-          return;
+        started = false;
+        node.error("No pullMessages on subscription/cam (check onvif version).");
+        return;
         }
 
-        // Optional: SetSynchronizationPoint (on sub or cam)
+        // Optional sync point (on sub or cam)
         if (node.enableSyncPoint) {
-          const setSync =
+        const setSync =
             (subscription && typeof subscription.setSynchronizationPoint === "function" && subscription.setSynchronizationPoint.bind(subscription)) ||
             (node.deviceConfig.cam && typeof node.deviceConfig.cam.setSynchronizationPoint === "function" && node.deviceConfig.cam.setSynchronizationPoint.bind(node.deviceConfig.cam));
-          try { setSync && setSync(() => {}); } catch (e) {}
+        try { setSync && setSync(() => {}); } catch (e) {}
         }
 
         node.status({ fill: "green", shape: "dot", text: "listening (pull)" });
-        // node.warn("PullPoint ready — using " + (pullFn === node.deviceConfig.cam.pullMessages ? "cam.pullMessages" : "subscription.pullMessages"));
 
         // Auto-renew (if supported)
-        clearRenew();
         if (node.enableAutoRenew && subscription && typeof subscription.renew === "function") {
-          node.renewalTimer = setInterval(() => {
-            if (!node.stopPulling) {
-              try { subscription.renew(() => {}); } catch (e) {}
-            }
-          }, 60_000);
+        node.renewalTimer = setInterval(() => {
+            if (!node.stopPulling) { try { subscription.renew(() => {}); } catch (e) {} }
+        }, 60_000);
         }
 
-        // Poll loop with gentle pacing + exponential backoff on errors
+        // Poll loop with gentle pacing + exponential backoff on error
         function poll() {
-          if (node.stopPulling) return;
+        if (node.stopPulling) return;
 
-          pullFn({ timeout: node.pullTimeout, messageLimit: node.pullLimit }, function (err, res) {
+        pullFn({ timeout: node.pullTimeout, messageLimit: node.pullLimit }, function (err, res) {
             if (err) {
-              node.errorCount = Math.min(node.errorCount + 1, 10);
-              const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
-              return void setTimeout(poll, backoff);
+            node.errorCount = Math.min(node.errorCount + 1, 10);
+            const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
+            return void setTimeout(poll, backoff);
             }
-
             node.errorCount = 0;
 
             const list = res && res.notificationMessage
-              ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
-              : [];
+            ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
+            : [];
 
             for (const n of list) {
-              const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
-              node.processEventMessage && node.processEventMessage(camMessage);
+            const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
+            node.processEventMessage && node.processEventMessage(camMessage);
             }
 
-            // Gentle delay helps reduce repeated pulls of same message on some TAPO firmwares
-            const delay = list.length ? node.gentleDelayWithMsgs : node.gentleDelayNoMsgs;
+            const delay = list.length ? node.gentleDelayWithMsgs : node.gentleDelayNoMsgs; // e.g. 50/250ms
             setTimeout(poll, delay);
-          });
+        });
         }
 
         poll();
-      });
+    });
     }
 
     // ---- Input API (backward compatible) ----
