@@ -146,11 +146,16 @@
                             }
                         };
 
-                        // create the PullPoint subscription
-                        node.deviceConfig.cam.createPullPointSubscription(function (err, subscription) {
+                        // create the PullPoint subscription with 5-minute timeout
+                        // C560 needs explicit termination time to avoid rapid expiry
+                        const subscriptionOptions = {
+                            InitialTerminationTime: 'PT5M'  // 5 minutes in ISO 8601 duration format
+                        };
+                        
+                        node.deviceConfig.cam.createPullPointSubscription(subscriptionOptions, function (err, subscription) {
                             if (err) {
-                            node.error("Failed to create pull point subscription: " + err);
-                            return;
+                                node.error("Failed to create pull point subscription: " + err);
+                                return;
                             }
 
                             node.subscription = subscription;
@@ -273,17 +278,19 @@
                                 });
                             }
 
-                            // renew timer - more aggressive for C560 (every 30s instead of 60s)
+                            // renew timer - very aggressive for C560 (every 2 minutes, well before 5-min expiry)
                             if (subscription && typeof subscription.renew === "function") {
                                 node.renewalTimer = setInterval(() => {
                                     if (!node.stopPulling && node.subscription) {
-                                        subscription.renew((err) => {
+                                        subscription.renew('PT5M', (err) => {  // Renew for another 5 minutes
                                             if (err) {
                                                 node.warn("Renewal failed: " + err + " - will recreate if needed");
+                                            } else {
+                                                node.warn("Subscription renewed for 5 more minutes");
                                             }
                                         });
                                     }
-                                }, 30000); // 30 seconds for better C560 support
+                                }, 120000); // 2 minutes (120 seconds)
                             }
 
                             poll();
