@@ -31,10 +31,25 @@
             node.listener = function(onvifStatus) {
                 utils.setNodeStatus(node, 'event', onvifStatus);
                 
-                if (onvifStatus !== "connected" && node.eventListener) {
-                    // When the device isn't connected anymore, stop listening to events from the camera
-                    node.deviceConfig.cam.removeListener('events', node.eventListener);
-                    node.eventListener = null;
+                if (onvifStatus !== "connected" && node.subscription) {
+                    // When the device isn't connected anymore, stop pulling events from the camera
+                    node.stopPulling = true;
+                    
+                    // Clear renewal timer
+                    if (node.renewalTimer) {
+                        clearInterval(node.renewalTimer);
+                        node.renewalTimer = null;
+                    }
+                    
+                    if (node.subscription && node.subscription.unsubscribe) {
+                        node.subscription.unsubscribe(function(err) {
+                            if (err) {
+                                console.log("Error unsubscribing on disconnect: " + err);
+                            }
+                        });
+                    }
+                    node.subscription = null;
+                    node.processEventMessage = null;
                 }
             }
             
@@ -84,168 +99,271 @@
             try {
                 switch (action) {
                     case "start":
-                        if (node.eventListener) {
+                        if (node.subscription) {
                             node.error("This node is already listening to device events");
                             return;
                         }
                         
-                        // Overwrite the device status text
-                        node.status({fill:"green",shape:"dot",text:"listening"}); 
-                        
-                        node.eventListener = function(camMessage) {
-                            var sourceName  = null;
-                            var sourceValue = null;
-                            var dataName    = null;
-                            var dataValue   = null;
-                            
-                            // Events have a Topic
-                            // Events have (optionally) a Source, a Key and Data fields
-                            // The Source,Key and Data fields can be single items or an array of items
-                            // The Source,Key and Data fields can be of type SimpleItem or a Complex Item
-                            //    - Topic
-                            //    - Message/Message/$
-                            //    - Message/Message/Source...
-                            //    - Message/Message/Key...
-                            //    - Message/Message/Data/SimpleItem/[index]/$/name   (array of items)
-                            // OR - Message/Message/Data/SimpleItem/$/name   (single item)
-                            //    - Message/Message/Data/SimpleItem/[index]/$/value   (array of items)
-                            // OR - Message/Message/Data/SimpleItem/$/value   (single item)
-
-                            var eventTopic = camMessage.topic._;
-                            
-                            // Strip the namespaces from the topic (e.g. tns1:MediaControl/tnsavg:ConfigurationUpdateAudioEncCfg)
-                            // Split on '/', then remove any namespace for each part, and at the end recombine parts that were split with '/'
-                            let parts = eventTopic.split('/');
-                            eventTopic = "";
-                            for (var index = 0; index < parts.length; index++) {
-                                var stringNoNamespace = parts[index].split(':').pop();
-                                if (eventTopic.length == 0) {
-                                    eventTopic += stringNoNamespace;
-                                } else {
-                                    eventTopic += '/' + stringNoNamespace;
-                                }
+                        // Create pull point subscription for Tapo camera compatibility
+                        node.deviceConfig.cam.createPullPointSubscription(function(err, subscription) {
+                            if (err) {
+                                node.error("Failed to create pull point subscription: " + err);
+                                return;
                             }
+                            
+                            node.subscription = subscription;
+                            node.stopPulling = false;
+                            node.errorCount = 0; // For exponential backoff
+                            
+                            // Overwrite the device status text
+                            node.status({fill:"green",shape:"dot",text:"listening"}); 
+                            
+                            // DEFINE processEventMessage BEFORE starting polling loop to avoid race condition
+                            node.processEventMessage = function(camMessage) {
+                                try {
+                                    // Defensive null-checks for message shapes
+                                    if (!camMessage || !camMessage.topic || !camMessage.message || 
+                                        !camMessage.message.message || !camMessage.message.message.$) {
+                                        console.log("Received malformed event message, skipping");
+                                        return;
+                                    }
+                                    
+                                    var eventTopic = camMessage.topic._ || camMessage.topic;
+                                    
+                                    // Handle topic as string directly if it's not an object
+                                    if (typeof eventTopic === 'string') {
+                                        // Strip the namespaces from the topic (e.g. tns1:MediaControl/tnsavg:ConfigurationUpdateAudioEncCfg)
+                                        // Split on '/', then remove any namespace for each part, and at the end recombine parts that were split with '/'
+                                        let parts = eventTopic.split('/');
+                                        eventTopic = "";
+                                        for (var index = 0; index < parts.length; index++) {
+                                            var stringNoNamespace = parts[index].split(':').pop();
+                                            if (eventTopic.length == 0) {
+                                                eventTopic += stringNoNamespace;
+                                            } else {
+                                                eventTopic += '/' + stringNoNamespace;
+                                            }
+                                        }
+                                    }
 
-                            var outputMsg = {
-                                topic: eventTopic,
-                                time: camMessage.message.message.$.UtcTime,
-                                property: camMessage.message.message.$.PropertyOperation // Initialized, Deleted or Changed but missing/undefined on the Avigilon 4 channel encoder
+                                    var outputMsg = {
+                                        topic: eventTopic,
+                                        time: camMessage.message.message.$.UtcTime,
+                                        property: camMessage.message.message.$.PropertyOperation // Initialized, Deleted or Changed but missing/undefined on the Avigilon 4 channel encoder
+                                    };
+
+                                    // Only handle simpleItem
+                                    // Only handle one 'source' item
+                                    // Ignore the 'key' item  (nothing I own produces it)
+                                    // Handle all the 'Data' items
+
+                                    // SOURCE (Name:Value)
+                                    if (camMessage.message.message.source && camMessage.message.message.source.simpleItem) {
+                                        if (Array.isArray(camMessage.message.message.source.simpleItem)) {
+                                            // TODO : currently we only process the first event source item ...
+                                            outputMsg.source = {
+                                                name:  camMessage.message.message.source.simpleItem[0].$.Name,
+                                                value: camMessage.message.message.source.simpleItem[0].$.Value
+                                            }
+                                        }
+                                        else {
+                                            outputMsg.source = {
+                                                name: camMessage.message.message.source.simpleItem.$.Name,
+                                                value: camMessage.message.message.source.simpleItem.$.Value
+                                            }
+                                        }
+                                    }
+                                    
+                                    //KEY
+                                    if (camMessage.message.message.key) {
+                                        outputMsg.key = camMessage.message.message.key;
+                                    }
+
+                                    // DATA (Name:Value)
+                                    if (camMessage.message.message.data && camMessage.message.message.data.simpleItem) {
+                                        if (Array.isArray(camMessage.message.message.data.simpleItem)) {
+                                            outputMsg.data = [];
+                                            for (var x  = 0; x < camMessage.message.message.data.simpleItem.length; x++) {
+                                                outputMsg.data.push({
+                                                    name: camMessage.message.message.data.simpleItem[x].$.Name,
+                                                    value: camMessage.message.message.data.simpleItem[x].$.Value
+                                                })
+                                            }
+                                        }
+                                        else {
+                                            outputMsg.data = {
+                                                name: camMessage.message.message.data.simpleItem.$.Name,
+                                                value: camMessage.message.message.data.simpleItem.$.Value
+                                            }
+                                        }
+                                    }
+                                    else if (camMessage.message.message.data && camMessage.message.message.data.elementItem) {
+                                        outputMsg.data = {
+                                            dataName: 'elementItem',
+                                            dataValue: JSON.stringify(camMessage.message.message.data.elementItem)
+                                        }
+                                    }
+
+                                    // As soon as we get an event from the camera, we will send it to the output of this node
+                                    node.send(outputMsg);
+                                } catch (err) {
+                                    console.log("Error processing event message: " + err);
+                                }
                             };
-
-                            // Only handle simpleItem
-                            // Only handle one 'source' item
-                            // Ignore the 'key' item  (nothing I own produces it)
-                            // Handle all the 'Data' items
-
-                            // SOURCE (Name:Value)
-                            if (camMessage.message.message.source && camMessage.message.message.source.simpleItem) {
-                                if (Array.isArray(camMessage.message.message.source.simpleItem)) {
-                                    // TODO : currently we only process the first event source item ...
-                                    outputMsg.source = {
-                                        name:  camMessage.message.message.source.simpleItem[0].$.Name,
-                                        value: camMessage.message.message.source.simpleItem[0].$.Value
-                                    }
+                            
+                            // Function to actively pull messages from the camera
+                            var pullMessages = function() {
+                                if (!node.subscription || node.stopPulling) {
+                                    return;
                                 }
-                                else {
-                                    outputMsg.source = {
-                                        name: camMessage.message.message.source.simpleItem.$.Name,
-                                        value: camMessage.message.message.source.simpleItem.$.Value
+                                
+                                // Pull messages with 1 second timeout and max 100 messages
+                                node.subscription.pullMessages({
+                                    timeout: 'PT1S',
+                                    messageLimit: 100
+                                }, function(err, result) {
+                                    if (err) {
+                                        // Only log error if not stopped intentionally
+                                        if (!node.stopPulling) {
+                                            node.errorCount = (node.errorCount || 0) + 1;
+                                            console.log("Error pulling messages (attempt " + node.errorCount + "): " + err);
+                                            
+                                            // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
+                                            var backoffDelay = Math.min(1000 * Math.pow(2, node.errorCount - 1), 30000);
+                                            setTimeout(pullMessages, backoffDelay);
+                                        }
+                                        return;
                                     }
-                                }
+                                    
+                                    // Reset error count on success
+                                    node.errorCount = 0;
+                                    
+                                    // Process notification messages
+                                    if (result && result.notificationMessage) {
+                                        var messages = Array.isArray(result.notificationMessage) 
+                                            ? result.notificationMessage 
+                                            : [result.notificationMessage];
+                                        
+                                        messages.forEach(function(notifMsg) {
+                                            // Convert notification message to the expected format
+                                            var camMessage = {
+                                                topic: notifMsg.topic,
+                                                message: notifMsg.message
+                                            };
+                                            
+                                            // Process using the event handler logic
+                                            if (node.processEventMessage) {
+                                                node.processEventMessage(camMessage);
+                                            }
+                                        });
+                                    }
+                                    
+                                    // Continue polling
+                                    if (!node.stopPulling) {
+                                        setImmediate(pullMessages);
+                                    }
+                                });
+                            };
+                            
+                            // Call SetSynchronizationPoint to get current property states (critical for Tapo cameras)
+                            if (node.subscription.setSynchronizationPoint) {
+                                node.subscription.setSynchronizationPoint(function(err) {
+                                    if (err) {
+                                        console.log("Note: setSynchronizationPoint returned: " + err);
+                                    }
+                                    // Start polling regardless of sync result
+                                    pullMessages();
+                                });
+                            } else {
+                                // Start polling immediately if sync not supported
+                                pullMessages();
                             }
                             
-                            //KEY
-                            if (camMessage.message.message.key) {
-                                outputMsg.key = camMessage.message.message.key;
-                            }
-
-                            // DATA (Name:Value)
-                            if (camMessage.message.message.data && camMessage.message.message.data.simpleItem) {
-                                if (Array.isArray(camMessage.message.message.data.simpleItem)) {
-                                    outputMsg.data = [];
-                                    for (var x  = 0; x < camMessage.message.message.data.simpleItem.length; x++) {
-                                        outputMsg.data.push({
-                                            name: camMessage.message.message.data.simpleItem[x].$.Name,
-                                            value: camMessage.message.message.data.simpleItem[x].$.Value
-                                        })
-                                    }
+                            // Set up subscription renewal to prevent expiry (every 60 seconds)
+                            const RENEW_INTERVAL_MS = 60 * 1000;
+                            node.renewalTimer = setInterval(function() {
+                                if (node.subscription && node.subscription.renew) {
+                                    node.subscription.renew(function(err) {
+                                        if (err) {
+                                            console.log("Error renewing subscription: " + err);
+                                        }
+                                    });
                                 }
-                                else {
-                                    outputMsg.data = {
-                                        name: camMessage.message.message.data.simpleItem.$.Name,
-                                        value: camMessage.message.message.data.simpleItem.$.Value
-                                    }
-                                }
-                            }
-                            else if (camMessage.message.message.data && camMessage.message.message.data.elementItem) {
-                                outputMsg.data = {
-                                    dataName: 'elementItem',
-                                    dataValue: JSON.stringify(camMessage.message.message.data.elementItem)
-                                }
-                            }
-
-                            // As soon as we get an event from the camera, we will send it to the output of this node
-                            node.send(outputMsg);
-                        }
-                        
-                        // Start listening to events from the camera
-                        node.deviceConfig.cam.on('event', node.eventListener);
+                            }, RENEW_INTERVAL_MS);
+                        });
                         break;
                     case "stop":
-                        if (!node.eventListener) {
+                        if (!node.subscription) {
                             node.error("This node was not listening to events anyway");
                             return;
                         }
 
-                        // Stop listening to events from the camera
-                        node.deviceConfig.cam.removeListener('event', node.eventListener);
-                        node.eventListener = null;
+                        // Stop the polling loop
+                        node.stopPulling = true;
+                        
+                        // Clear renewal timer
+                        if (node.renewalTimer) {
+                            clearInterval(node.renewalTimer);
+                            node.renewalTimer = null;
+                        }
+                        
+                        // Unsubscribe from pull point
+                        if (node.subscription && node.subscription.unsubscribe) {
+                            node.subscription.unsubscribe(function(err) {
+                                if (err) {
+                                    console.log("Error unsubscribing: " + err);
+                                }
+                            });
+                        }
+                        
+                        node.subscription = null;
+                        node.processEventMessage = null;
                         
                         // Overwrite the device status text
                         node.status({fill:"green",shape:"ring",text:"not listening"}); 
                         break;               
                     case "getEventProperties":
-                        node.deviceConfig.cam.getEventProperties(function(err, date, xml) {
+                        node.deviceConfig.cam.getEventProperties(function(err, eventProperties, xml) {
                             if (!err) {
-                                var simplifiedDate = {};
+                                var simplifiedProperties = {};
                                 
                                 // Simplify the soap message to a compact message, by keeping only all relevant information
-                                function simplifyNode(node, simplifiedDateChild) {
+                                function simplifyNode(treeNode, simplifiedChild) {
                                     // loop over all the child nodes in this node
-                                    for (const child in node) {
+                                    for (const child in treeNode) {
                                         switch (child) {
                                             case "$":
                                                 // Continue to the next child in the list (same level)
                                                 continue;
                                             case "messageDescription":
                                                 // Collect the details that belong to the event
-                                                var source = '';
-                                                var date = '';
-                                                
-                                                if (node[child].source && node[child].source.simpleItemDescription) {
-                                                    simplifiedDateChild.source = node[child].source.simpleItemDescription.$;
+                                                if (treeNode[child].source && treeNode[child].source.simpleItemDescription) {
+                                                    simplifiedChild.source = treeNode[child].source.simpleItemDescription.$;
                                                 }
-                                                if (node[child].data && node[child].data.simpleItemDescriptio) {
-                                                    simplifiedDateChild.date = node[child].data.simpleItemDescription.$;
+                                                if (treeNode[child].data && treeNode[child].data.simpleItemDescription) {
+                                                    simplifiedChild.data = treeNode[child].data.simpleItemDescription.$;
                                                 }
                                                 
                                                 return;
                                             default:
-                                                // Decend recursively into the child node, looking for the messageDescription
-                                                simplifiedDateChild[child] = {};
-                                                simplifyNode(node[child], simplifiedDateChild[child]);
+                                                // Descend recursively into the child node, looking for the messageDescription
+                                                simplifiedChild[child] = {};
+                                                simplifyNode(treeNode[child], simplifiedChild[child]);
                                         }
                                     }
                                 }
-                                simplifyNode(date.topicSet, simplifiedDate)
+                                
+                                if (eventProperties && eventProperties.topicSet) {
+                                    simplifyNode(eventProperties.topicSet, simplifiedProperties);
+                                }
                             }
                             
-                            utils.handleResult(node, err, simplifiedDate, null, newMsg);
+                            utils.handleResult(node, err, simplifiedProperties, null, newMsg);
                         });
                         break;
                     case "getEventServiceCapabilities":
-                        node.deviceConfig.cam.getEventServiceCapabilities(function(err, date, xml) {
-                            utils.handleResult(node, err, date, xml, newMsg);
+                        node.deviceConfig.cam.getEventServiceCapabilities(function(err, capabilities, xml) {
+                            utils.handleResult(node, err, capabilities, xml, newMsg);
                         });
                         break;
                     case "reconnect":
@@ -268,11 +386,26 @@
                 node.deviceConfig.removeListener("onvif_status", node.listener);
             }
             
-            // Stop listening to events from the camera
-            if (node.eventListener) {
-                node.deviceConfig.cam.removeListener('event', node.eventListener);
-                node.eventListener = null;
+            // Stop the polling loop
+            node.stopPulling = true;
+            
+            // Clear renewal timer
+            if (node.renewalTimer) {
+                clearInterval(node.renewalTimer);
+                node.renewalTimer = null;
             }
+            
+            // Unsubscribe from pull point
+            if (node.subscription && node.subscription.unsubscribe) {
+                node.subscription.unsubscribe(function(err) {
+                    if (err) {
+                        console.log("Error unsubscribing on close: " + err);
+                    }
+                });
+            }
+            
+            node.subscription = null;
+            node.processEventMessage = null;
         });
     }
     RED.nodes.registerType("onvif-events",OnVifEventsNode);
