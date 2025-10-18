@@ -29,7 +29,10 @@
         
         if (node.deviceConfig) {
             node.listener = function(onvifStatus) {
-                utils.setNodeStatus(node, 'event', onvifStatus);
+                // Only update status if not currently listening
+                if (!node.subscription) {
+                    utils.setNodeStatus(node, 'event', onvifStatus);
+                }
                 
                 if (onvifStatus !== "connected" && node.subscription) {
                     // When the device isn't connected anymore, stop pulling events from the camera
@@ -321,17 +324,21 @@
                                 });
                             }
 
-                            // renew timer - frequent renewal for C560 (every 60 seconds)
+                            // renew timer - aggressive renewal for both C100 and C560 (every 45 seconds)
                             if (subscription && typeof subscription.renew === "function") {
                                 node.renewalTimer = setInterval(() => {
                                     if (!node.stopPulling && node.subscription) {
                                         subscription.renew((err) => {
                                             if (err) {
-                                                node.warn("Renewal failed: " + err);
+                                                node.warn("Renewal failed: " + err + " - subscription may expire soon");
+                                            } else {
+                                                node.warn("Subscription renewed successfully");
                                             }
                                         });
                                     }
-                                }, 60000); // 60 seconds - frequent renewal for C560
+                                }, 45000); // 45 seconds - works for both C100 and C560
+                            } else {
+                                node.warn("Note: Subscription does not support renewal - relying on recreation if needed");
                             }
 
                             poll();
