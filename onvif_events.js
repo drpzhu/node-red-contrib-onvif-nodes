@@ -212,8 +212,10 @@
 
                                 pullFn({ timeout: "PT1S", messageLimit: 100 }, function (err, res) {
                                     if (err) {
-                                        // Check if this is a subscription expiry error
+                                        // Check if this is a subscription/network error that requires recreation
                                         const errStr = (err.message || err.toString()).toLowerCase();
+                                        const errCode = err.code || "";
+                                        
                                         const isSubscriptionError = 
                                             errStr.includes("subscription") ||
                                             errStr.includes("pullmessages") ||
@@ -221,6 +223,16 @@
                                             errStr.includes("not found") ||
                                             errStr.includes("terminated") ||
                                             errStr.includes("expired");
+                                        
+                                        // Network errors that indicate subscription is dead (C560 specific)
+                                        const isNetworkError =
+                                            errStr.includes("socket hang up") ||
+                                            errStr.includes("econnreset") ||
+                                            errStr.includes("etimedout") ||
+                                            errStr.includes("econnrefused") ||
+                                            errCode === "ECONNRESET" ||
+                                            errCode === "ETIMEDOUT" ||
+                                            errCode === "ECONNREFUSED";
                                         
                                         if (isSubscriptionError) {
                                             node.warn("Subscription error detected: " + err);
@@ -230,13 +242,14 @@
                                             return;
                                         }
                                         
-                                        // Regular error - use backoff
+                                        // Track consecutive errors
                                         node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
                                         const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
                                         node.warn("Poll error (attempt " + node.errorCount + "): " + err);
                                         
-                                        // After 5 consecutive failures, try recreating subscription
-                                        if (node.errorCount >= 5 && !node.stopPulling) {
+                                        // Network errors or 3+ consecutive failures = recreate subscription (C560 needs faster recovery)
+                                        if ((isNetworkError || node.errorCount >= 3) && !node.stopPulling) {
+                                            node.warn("Network/repeated error detected - recreating subscription");
                                             recreateSubscription();
                                             return;
                                         }
