@@ -13,355 +13,325 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  **/
- // onvif_events.js — PullPoint (Inject-to-start) with auto-renew + watchdog + gentle pacing
+ module.exports = function(RED) {
+    var settings = RED.settings;
+    const onvif = require('onvif');
+    const utils = require('./utils');
+    
+    function OnVifEventsNode(config) {
+        RED.nodes.createNode(this, config);
+        this.action = config.action;
 
-module.exports = function (RED) {
-  const onvif = require("onvif");
-  const { URL } = require("url");
-
-  function OnvifEventsNode(config) {
-    RED.nodes.createNode(this, config);
-    const node = this;
-
-    // ---- Camera config node (selected in the editor) ----
-    node.deviceConfig = RED.nodes.getNode(config.config);
-
-    // ---- Sensible defaults (so missing editor fields won't break us) ----
-    node.pullTimeout = node.pullTimeout || "PT1S";
-    node.pullLimit = Number(node.pullLimit || 100);
-    node.gentleDelayWithMsgs = Number(node.gentleDelayWithMsgs || 50);   // ms after a batch
-    node.gentleDelayNoMsgs   = Number(node.gentleDelayNoMsgs   || 250);  // ms when idle
-    node.enableAutoRenew = (typeof node.enableAutoRenew === "boolean") ? node.enableAutoRenew : true;
-
-    // ---- Internal state ----
-    node.stopPulling = false;
-    node.subscription = null;
-    node.renewalTimer = null;
-    node.errorCount = 0;
-
-    // ---- De-dup helpers ----
-    node._lastState = new Map(); // topic => 'true'|'false'
-    node._seenTTL = new Map();   // hash => timestamp
-
-    function pruneTTL(nowMs) {
-      for (const [k, t] of node._seenTTL) {
-        if (nowMs - t > 10000) node._seenTTL.delete(k); // 10s TTL window
-      }
-    }
-
-    function deNs(topic) {
-      if (typeof topic !== "string") return topic;
-      return topic.split("/").map(p => p.split(":").pop()).join("/");
-    }
-
-    // ---- (Optional) build a local Cam if config.cam isn’t ready ----
-    async function makeLocalCamFromConfig(cfgNode) {
-    if (!cfgNode) return null;
-
-    // Prefer xaddress, but tolerate bare host:port or just host
-    let raw = (cfgNode.xaddress || "").trim();
-    if (!raw) {
-        // try separate fields some configs use
-        const host = (cfgNode.host || cfgNode.hostname || "").trim();
-        const port = (cfgNode.port || "").toString().trim();
-        if (!host) return null;
-        raw = host + (port ? (":" + port) : "");
-    }
-
-    // Add scheme if missing
-    if (!/^https?:\/\//i.test(raw)) raw = "http://" + raw;
-
-    // Ensure path
-    if (/^https?:\/\/[^/]+\/?$/i.test(raw)) {
-        // no path -> default ONVIF device service path
-        if (!raw.endsWith("/")) raw += "/";
-        raw += "onvif/device_service";
-    }
-
-    let u;
-    try {
-        u = new URL(raw);
-    } catch (e) {
-        node.warn("makeLocalCamFromConfig error (normalize): " + e.message + " | raw=" + raw);
-        return null;
-    }
-
-    // Default port: if none given, use 2020 (Tapo); otherwise use provided
-    const portNum = u.port ? Number(u.port) : 2020;
-
-    const opts = {
-        hostname: u.hostname,
-        port: portNum,
-        username: cfgNode.user || cfgNode.username,
-        password: cfgNode.pass || cfgNode.password,
-        path: u.pathname || "/onvif/device_service",
-        timeout: 5000
-    };
-
-    // Breadcrumb to confirm what we’re dialing (password omitted)
-    node.status({ fill: "yellow", shape: "ring", text: `connecting ${opts.hostname}:${opts.port}${opts.path}` });
-
-    return await new Promise((resolve, reject) => {
-        // eslint-disable-next-line no-new
-        new (require("onvif").Cam)(opts, function (err) {
-        if (err) return reject(err);
-        resolve(this); // 'this' is the Cam instance
-        });
-    });
-    }
-
-    // ---- Normalize + de-dup outgoing events ----
-    function emitEvent(camMessage) {
-      if (!camMessage) return;
-
-      const rawTopic = (camMessage.topic && (camMessage.topic._ || camMessage.topic)) || "";
-      const eventTopic = deNs(rawTopic);
-      const mm = camMessage.message && camMessage.message.message;
-      if (!mm || !mm.$) return;
-
-      const out = {
-        topic: eventTopic,
-        time: mm.$.UtcTime,
-        property: mm.$.PropertyOperation
-      };
-
-      // source (first simpleItem)
-      if (mm.source && mm.source.simpleItem) {
-        const s = Array.isArray(mm.source.simpleItem)
-          ? mm.source.simpleItem[0]
-          : mm.source.simpleItem;
-        if (s && s.$) out.source = { name: s.$.Name, value: s.$.Value };
-      }
-      if (mm.key) out.key = mm.key;
-
-      // data
-      if (mm.data && mm.data.simpleItem) {
-        if (Array.isArray(mm.data.simpleItem)) {
-          out.data = mm.data.simpleItem.map(x => x && x.$ ? ({ name: x.$.Name, value: x.$.Value }) : x);
-        } else if (mm.data.simpleItem.$) {
-          out.data = { name: mm.data.simpleItem.$.Name, value: mm.data.simpleItem.$.Value };
-        }
-      } else if (mm.data && mm.data.elementItem) {
-        out.data = { dataName: "elementItem", dataValue: JSON.stringify(mm.data.elementItem) };
-      }
-
-      // Ignore one-time "Initialized"
-      if (out.property && /initialized/i.test(out.property)) return;
-
-      // State-change filter for IsMotion / IsPeople etc.
-      let stateStr;
-      if (out.data) {
-        const items = Array.isArray(out.data) ? out.data : [out.data];
-        const stateItem = items.find(x => x && (x.name === "IsMotion" || x.name === "IsPeople"));
-        if (stateItem) stateStr = String(stateItem.value).toLowerCase();
-      }
-      const keyTopic = out.topic || "unknown";
-      if (stateStr === "true" || stateStr === "false") {
-        const prev = node._lastState.get(keyTopic);
-        if (prev === stateStr) return;          // drop identical state
-        node._lastState.set(keyTopic, stateStr);
-      }
-
-      // TTL de-dup (identical payloads within 10s)
-      const hash = keyTopic + "|" + (out.time || "") + "|" + JSON.stringify(out.data || {});
-      const now = Date.now();
-      if (node._seenTTL.has(hash) && (now - node._seenTTL.get(hash) < 10000)) return;
-      node._seenTTL.set(hash, now);
-      pruneTTL(now);
-
-      // Emit with the event as payload, topic preserved for Node-RED
-      node.send({ topic: out.topic, payload: out });
-    }
-
-    // ---- Restart helper (used by renew/pull watchdog) ----
-    function restartSubscription(reason) {
-      node.status({ fill: "yellow", shape: "ring", text: "restarting (" + reason + ")" });
-      node.stopPulling = true;
-
-      if (node.renewalTimer) {
-        clearInterval(node.renewalTimer);
-        node.renewalTimer = null;
-      }
-      if (node.subscription && typeof node.subscription.unsubscribe === "function") {
-        try { node.subscription.unsubscribe(() => {}); } catch (_) {}
-      }
-      node.subscription = null;
-
-      // Re-enter via our own input path after a short pause
-      setTimeout(() => node.receive({ action: "start" }), 1000);
-    }
-
-    // ---- Handle incoming actions ----
-    node.on("input", async (msg) => {
-    const action =
-        (msg && msg.action) ||
-        (msg && msg.payload && msg.payload.action);
-
-    // ----- STOP -----
-    if (action === "stop") {
-        node.stopPulling = true;
-        if (node.renewalTimer) { clearInterval(node.renewalTimer); node.renewalTimer = null; }
-        if (node.subscription && typeof node.subscription.unsubscribe === "function") {
-        try { node.subscription.unsubscribe(() => {}); } catch (_) {}
-        }
-        node.subscription = null;
-        node.status({ fill: "grey", shape: "ring", text: "stopped" });
-        return;
-    }
-
-    // ----- READ-ONLY CALLS -----
-    if (action === "getEventProperties" || action === "getEventServiceCapabilities") {
-        // (re)resolve config and get a cam (prefer config.cam; else build one)
-        const cfgId = (config && (config.config || config.deviceConfig || config.camera || config.cam)) || null;
-        node.deviceConfig = cfgId ? RED.nodes.getNode(cfgId) : null;
-
-        const cam = (node.deviceConfig && node.deviceConfig.cam) || (await makeLocalCamFromConfig(node.deviceConfig));
-        if (!cam) return node.error(action + ": no camera");
-        const call = action === "getEventProperties" ? cam.getEventProperties : cam.getEventServiceCapabilities;
-        call.call(cam, (err, result /*, xml */) => {
-        if (err) return node.error(action + " failed: " + err);
-        node.send({ topic: action, payload: result });
-        });
-        return;
-    }
-
-    // ----- START (PullPoint) -----
-    if (action === "start") {
-        if (node.subscription) {
-        node.error("This node is already listening to device events");
-        return;
-        }
-
-        // (re)resolve config **now** so UI changes take effect immediately
-        const cfgId = (config && (config.config || config.deviceConfig || config.camera || config.cam)) || null;
-        node.deviceConfig = cfgId ? RED.nodes.getNode(cfgId) : null;
-
-        node.stopPulling = false;
-
-        // Prefer config.cam; else create our own
-        let cam = node.deviceConfig && node.deviceConfig.cam;
-        if (!cam && node.deviceConfig) {
-        node.status({ fill: "yellow", shape: "ring", text: "connecting (own cam)" });
-        try { cam = await makeLocalCamFromConfig(node.deviceConfig); } catch (_) {}
-        }
-        if (!cam) {
-        node.status({ fill: "yellow", shape: "ring", text: node.deviceConfig ? "no camera ready" : "no camera configured" });
-        return;
-        }
-
-        cam.createPullPointSubscription((err, subscription /*, terminationTime */) => {
-        if (err) {
-            node.status({ fill: "red", shape: "ring", text: "pullpoint failed: " + String(err).slice(0, 60) });
-            return;
-        }
-
-        node.subscription = subscription;
-        node.errorCount = 0;
-
-        const pullFn =
-            (subscription && typeof subscription.pullMessages === "function" && subscription.pullMessages.bind(subscription)) ||
-            (subscription && typeof subscription.PullMessages === "function" && subscription.PullMessages.bind(subscription)) ||
-            (typeof cam.pullMessages === "function" && cam.pullMessages.bind(cam));
-
-        if (!pullFn) {
-            node.error("No pullMessages on subscription/cam (check onvif version).");
-            return;
-        }
-
-        // optional sync point
-        const setSync =
-            (subscription && typeof subscription.setSynchronizationPoint === "function" && subscription.setSynchronizationPoint.bind(subscription)) ||
-            (typeof cam.setSynchronizationPoint === "function" && cam.setSynchronizationPoint.bind(cam));
-        try { setSync && setSync(() => {}); } catch (_) {}
-
-        node.status({ fill: "green", shape: "dot", text: "listening (pull)" });
-        node.warn("PullPoint ready — using " + (pullFn === (cam && cam.pullMessages) ? "cam.pullMessages" : "subscription.pullMessages"));
-
-        // --- TTL-aware renew (fallback 120s) ---
-        function parseIsoToMs(s) { try { return Math.max(0, Date.parse(s) - Date.now()); } catch { return 0; } }
-        let ttlMs =
-            parseIsoToMs(subscription && (subscription.terminationTime || subscription.TerminationTime));
-        if (!ttlMs || !isFinite(ttlMs)) ttlMs = 120000;
-        const renewEvery = Math.min(90000, Math.max(30000, Math.floor(ttlMs * 0.6)));
-        if (node.enableAutoRenew && typeof subscription.renew === "function") {
-            if (node.renewalTimer) { clearInterval(node.renewalTimer); node.renewalTimer = null; }
-            node.renewalTimer = setInterval(() => {
-            if (node.stopPulling) return;
-            subscription.renew((rErr) => {
-                if (rErr) {
-                node.warn("PullPoint renew failed: " + rErr);
-                // self-heal
-                restartSubscription("renew-failed");
+        var node = this;
+        
+        // Retrieve the config node, where the device is configured
+        node.deviceConfig = RED.nodes.getNode(config.deviceConfig);
+        
+        if (node.deviceConfig) {
+            node.listener = function(onvifStatus) {
+                utils.setNodeStatus(node, 'event', onvifStatus);
+                
+                if (onvifStatus !== "connected" && node.subscription) {
+                    // When the device isn't connected anymore, stop pulling events from the camera
+                    node.stopPulling = true;
+                    
+                    // Clear renewal timer
+                    if (node.renewalTimer) {
+                        clearInterval(node.renewalTimer);
+                        node.renewalTimer = null;
+                    }
+                    
+                    if (node.subscription && node.subscription.unsubscribe) {
+                        node.subscription.unsubscribe(function(err) {
+                            if (err) {
+                                console.log("Error unsubscribing on disconnect: " + err);
+                            }
+                        });
+                    }
+                    node.subscription = null;
+                    node.processEventMessage = null;
                 }
-            });
-            }, renewEvery);
+            }
+            
+            // Start listening for Onvif config nodes status changes
+            node.deviceConfig.addListener("onvif_status", node.listener);
+            
+            // Show the current Onvif config node status already
+            utils.setNodeStatus(node, 'event', node.deviceConfig.onvifStatus);
+            
+            node.deviceConfig.initialize();
         }
-
-        // --- poll with gentle pacing + backoff + watchdog ---
-        let lastOk = Date.now();
-        const watchdogMs = 75 * 1000;
-
-        function poll() {
-            if (node.stopPulling) return;
-
-            pullFn({ timeout: node.pullTimeout, messageLimit: node.pullLimit }, (pErr, res) => {
-            if (pErr) {
-                node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
-                const s = String(pErr || "");
-                if (s.includes("wsa:MessageInformationHeaderRequired")
-                || s.toLowerCase().includes("terminat")
-                || s.toLowerCase().includes("expired")
-                || node.errorCount >= 3) {
-                return restartSubscription("pull-error");
+               
+        node.on("input", function(msg) {  
+            var newMsg = {};
+            
+            // Note: the node's config screen has no 'action' input field yet ...
+            var action = node.action || msg.action;
+            
+            if (!action) {
+                // When no action specified in the node, it should be specified in the msg.action
+                node.error("No action specified (in node or msg)");
+                return;
+            }
+            
+            // Don't perform these checks when e.g. the device is currently disconnected (because then e.g. no capabilities are loaded yet)
+            if (action !== "reconnect") {
+                if (!node.deviceConfig || node.deviceConfig.onvifStatus != "connected") {
+                    node.error("This node is not connected to a device");
+                    return;
                 }
-                const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
-                return void setTimeout(poll, backoff);
+
+                if (!utils.hasService(node.deviceConfig.cam, 'event')) {
+                    node.error("The device has no support for an event service");
+                    return;
+                }
             }
+            
+            // Seems that some Axis cams support pull point, although they return WSPullPointSupport 'false'
+            /*if (!node.deviceConfig.cam.capabilities.events.WSPullPointSupport == true) {
+                //console.warn('Ignoring input message since the device does not support pull point subscription');
+                return;
+            }*/
+            
+            newMsg.xaddr = this.deviceConfig.xaddress;
+            newMsg.action = action;
 
-            node.errorCount = 0;
-            lastOk = Date.now();
+            try {
+                switch (action) {
+                    case "start":
+                        if (node.subscription) {
+                            node.error("This node is already listening to device events");
+                            return;
+                        }
 
-            const list = res && res.notificationMessage
-                ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
-                : [];
+                        // define processor BEFORE any polling can happen
+                        node.processEventMessage = function (camMessage) {
+                            try {
+                            if (!camMessage) return;
 
-            for (const n of list) {
-                const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
-                emitEvent(camMessage);
+                            const topicRaw = (camMessage.topic && (camMessage.topic._ || camMessage.topic)) || "";
+                            const eventTopic = (typeof topicRaw === "string")
+                                ? topicRaw.split("/").map(p => p.split(":").pop()).join("/")
+                                : topicRaw;
+
+                            const mm = camMessage.message && camMessage.message.message;
+                            if (!mm || !mm.$) return;
+
+                            const out = {
+                                topic: eventTopic,
+                                time: mm.$.UtcTime,
+                                property: mm.$.PropertyOperation
+                            };
+
+                            if (mm.source && mm.source.simpleItem) {
+                                const s = Array.isArray(mm.source.simpleItem) ? mm.source.simpleItem[0] : mm.source.simpleItem;
+                                if (s && s.$) out.source = { name: s.$.Name, value: s.$.Value };
+                            }
+                            if (mm.key) out.key = mm.key;
+
+                            if (mm.data && mm.data.simpleItem) {
+                                if (Array.isArray(mm.data.simpleItem)) {
+                                out.data = mm.data.simpleItem.map(x => x.$ ? ({ name: x.$.Name, value: x.$.Value }) : x);
+                                } else if (mm.data.simpleItem.$) {
+                                out.data = { name: mm.data.simpleItem.$.Name, value: mm.data.simpleItem.$.Value };
+                                }
+                            } else if (mm.data && mm.data.elementItem) {
+                                out.data = { dataName: "elementItem", dataValue: JSON.stringify(mm.data.elementItem) };
+                            }
+
+                            node.send({ topic: out.topic, payload: out });
+
+                            } catch (e) {
+                            node.warn("processEventMessage error: " + e);
+                            }
+                        };
+
+                        // create the PullPoint subscription
+                        node.deviceConfig.cam.createPullPointSubscription(function (err, subscription) {
+                            if (err) {
+                            node.error("Failed to create pull point subscription: " + err);
+                            return;
+                            }
+
+                            node.subscription = subscription;
+                            node.stopPulling = false;
+                            node.errorCount = 0;
+
+                            // pick a working pull function (sub vs cam) for onvif@0.6.9 compatibility
+                            const pullFn =
+                            (subscription && typeof subscription.pullMessages === "function" && subscription.pullMessages.bind(subscription)) ||
+                            (subscription && typeof subscription.PullMessages === "function" && subscription.PullMessages.bind(subscription)) ||
+                            (node.deviceConfig.cam && typeof node.deviceConfig.cam.pullMessages === "function" && node.deviceConfig.cam.pullMessages.bind(node.deviceConfig.cam));
+
+                            if (!pullFn) {
+                            node.error("PullPoint has no pullMessages/PullMessages and cam has no pullMessages. Check onvif version.");
+                            return;
+                            }
+
+                            // Set sync point if available (on sub or cam, varies by lib)
+                            const setSync =
+                            (subscription && typeof subscription.setSynchronizationPoint === "function" && subscription.setSynchronizationPoint.bind(subscription)) ||
+                            (node.deviceConfig.cam && typeof node.deviceConfig.cam.setSynchronizationPoint === "function" && node.deviceConfig.cam.setSynchronizationPoint.bind(node.deviceConfig.cam));
+
+                            if (setSync) {
+                            try { setSync(() => {}); } catch (e) { /* ignore */ }
+                            }
+
+                            node.status({ fill: "green", shape: "dot", text: "listening (pull)" });
+                            node.warn("PullPoint ready — using " + (pullFn === node.deviceConfig.cam.pullMessages ? "cam.pullMessages" : "subscription.pullMessages"));
+
+                            // single poll loop with exponential backoff
+                            function poll() {
+                            if (node.stopPulling) return;
+
+                            pullFn({ timeout: "PT1S", messageLimit: 100 }, function (err, res) {
+                                if (err) {
+                                node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
+                                const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
+                                if (!node.stopPulling) setTimeout(poll, backoff);
+                                return;
+                                }
+                                node.errorCount = 0;
+
+                                const list = res && res.notificationMessage
+                                ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
+                                : [];
+
+                                for (const n of list) {
+                                const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
+                                if (node.processEventMessage) node.processEventMessage(camMessage);
+                                }
+
+                                if (!node.stopPulling) setTimeout(poll, 0);
+                            });
+                            }
+
+                            // renew timer (some stacks expose renew on sub; fine to skip if absent)
+                            if (subscription && typeof subscription.renew === "function") {
+                            node.renewalTimer = setInterval(() => {
+                                if (!node.stopPulling) subscription.renew(() => {});
+                            }, 60000);
+                            }
+
+                            poll();
+                        });
+
+                        break;
+                    case "stop":
+                        if (!node.subscription) {
+                            node.error("This node was not listening to events anyway");
+                            return;
+                        }
+
+                        // Stop the polling loop
+                        node.stopPulling = true;
+                        
+                        // Clear renewal timer
+                        if (node.renewalTimer) {
+                            clearInterval(node.renewalTimer);
+                            node.renewalTimer = null;
+                        }
+                        
+                        // Unsubscribe from pull point
+                        if (node.subscription && node.subscription.unsubscribe) {
+                            node.subscription.unsubscribe(function(err) {
+                                if (err) {
+                                    console.log("Error unsubscribing: " + err);
+                                }
+                            });
+                        }
+                        
+                        node.subscription = null;
+                        node.processEventMessage = null;
+                        
+                        // Overwrite the device status text
+                        node.status({fill:"green",shape:"ring",text:"not listening"}); 
+                        break;               
+                    case "getEventProperties":
+                        node.deviceConfig.cam.getEventProperties(function(err, eventProperties, xml) {
+                            if (!err) {
+                                var simplifiedProperties = {};
+                                
+                                // Simplify the soap message to a compact message, by keeping only all relevant information
+                                function simplifyNode(treeNode, simplifiedChild) {
+                                    // loop over all the child nodes in this node
+                                    for (const child in treeNode) {
+                                        switch (child) {
+                                            case "$":
+                                                // Continue to the next child in the list (same level)
+                                                continue;
+                                            case "messageDescription":
+                                                // Collect the details that belong to the event
+                                                if (treeNode[child].source && treeNode[child].source.simpleItemDescription) {
+                                                    simplifiedChild.source = treeNode[child].source.simpleItemDescription.$;
+                                                }
+                                                if (treeNode[child].data && treeNode[child].data.simpleItemDescription) {
+                                                    simplifiedChild.data = treeNode[child].data.simpleItemDescription.$;
+                                                }
+                                                
+                                                return;
+                                            default:
+                                                // Descend recursively into the child node, looking for the messageDescription
+                                                simplifiedChild[child] = {};
+                                                simplifyNode(treeNode[child], simplifiedChild[child]);
+                                        }
+                                    }
+                                }
+                                
+                                if (eventProperties && eventProperties.topicSet) {
+                                    simplifyNode(eventProperties.topicSet, simplifiedProperties);
+                                }
+                            }
+                            
+                            utils.handleResult(node, err, simplifiedProperties, null, newMsg);
+                        });
+                        break;
+                    case "getEventServiceCapabilities":
+                        node.deviceConfig.cam.getEventServiceCapabilities(function(err, capabilities, xml) {
+                            utils.handleResult(node, err, capabilities, xml, newMsg);
+                        });
+                        break;
+                    case "reconnect":
+                        node.deviceConfig.cam.connect(function(err) {
+                            utils.handleResult(node, err, "", null, newMsg);
+                        });
+                        break
+                    default:
+                        //node.status({fill:"red",shape:"dot",text: "unsupported action"});
+                        node.error("Action " + action + " is not supported");                   
+                }
             }
-
-            const delay = list.length ? node.gentleDelayWithMsgs : node.gentleDelayNoMsgs;
-            setTimeout(() => {
-                if (Date.now() - lastOk > watchdogMs) return restartSubscription("watchdog");
-                poll();
-            }, delay);
-            });
-        }
-
-        poll();
+            catch (exc) {
+                node.error("Action " + action + " failed: " + exc);
+            }
         });
-
-        return; // done with "start"
+        
+        node.on("close",function() { 
+            if (node.listener) {
+                node.deviceConfig.removeListener("onvif_status", node.listener);
+            }
+            
+            // Stop the polling loop
+            node.stopPulling = true;
+            
+            // Clear renewal timer
+            if (node.renewalTimer) {
+                clearInterval(node.renewalTimer);
+                node.renewalTimer = null;
+            }
+            
+            // Unsubscribe from pull point
+            if (node.subscription && node.subscription.unsubscribe) {
+                node.subscription.unsubscribe(function(err) {
+                    if (err) {
+                        console.log("Error unsubscribing on close: " + err);
+                    }
+                });
+            }
+            
+            node.subscription = null;
+            node.processEventMessage = null;
+        });
     }
-
-    // ignore anything else
-    });
-
-
-    // ---- Cleanup on node close ----
-    node.on("close", (removed, done) => {
-      node.stopPulling = true;
-      if (node.renewalTimer) { clearInterval(node.renewalTimer); node.renewalTimer = null; }
-      if (node.subscription && typeof node.subscription.unsubscribe === "function") {
-        try { node.subscription.unsubscribe(() => {}); } catch (_) {}
-      }
-      node.subscription = null;
-      done && done();
-    });
-
-    // initial status
-    node.status({ fill: "grey", shape: "ring", text: "idle" });
-  }
-
-  RED.nodes.registerType("onvif-events", OnvifEventsNode);
-};
+    RED.nodes.registerType("onvif-events",OnVifEventsNode);
+}
