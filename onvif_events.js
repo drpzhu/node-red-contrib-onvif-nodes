@@ -103,194 +103,118 @@
                             node.error("This node is already listening to device events");
                             return;
                         }
-                        
-                        // Create pull point subscription for Tapo camera compatibility
-                        node.deviceConfig.cam.createPullPointSubscription(function(err, subscription) {
-                            if (err) {
-                                node.error("Failed to create pull point subscription: " + err);
-                                return;
+
+                        // define processor BEFORE any polling can happen
+                        node.processEventMessage = function (camMessage) {
+                            try {
+                            if (!camMessage) return;
+
+                            const topicRaw = (camMessage.topic && (camMessage.topic._ || camMessage.topic)) || "";
+                            const eventTopic = (typeof topicRaw === "string")
+                                ? topicRaw.split("/").map(p => p.split(":").pop()).join("/")
+                                : topicRaw;
+
+                            const mm = camMessage.message && camMessage.message.message;
+                            if (!mm || !mm.$) return;
+
+                            const out = {
+                                topic: eventTopic,
+                                time: mm.$.UtcTime,
+                                property: mm.$.PropertyOperation
+                            };
+
+                            if (mm.source && mm.source.simpleItem) {
+                                const s = Array.isArray(mm.source.simpleItem) ? mm.source.simpleItem[0] : mm.source.simpleItem;
+                                if (s && s.$) out.source = { name: s.$.Name, value: s.$.Value };
                             }
-                            
+                            if (mm.key) out.key = mm.key;
+
+                            if (mm.data && mm.data.simpleItem) {
+                                if (Array.isArray(mm.data.simpleItem)) {
+                                out.data = mm.data.simpleItem.map(x => x.$ ? ({ name: x.$.Name, value: x.$.Value }) : x);
+                                } else if (mm.data.simpleItem.$) {
+                                out.data = { name: mm.data.simpleItem.$.Name, value: mm.data.simpleItem.$.Value };
+                                }
+                            } else if (mm.data && mm.data.elementItem) {
+                                out.data = { dataName: "elementItem", dataValue: JSON.stringify(mm.data.elementItem) };
+                            }
+
+                            node.send(out);
+                            } catch (e) {
+                            node.warn("processEventMessage error: " + e);
+                            }
+                        };
+
+                        // create the PullPoint subscription
+                        node.deviceConfig.cam.createPullPointSubscription(function (err, subscription) {
+                            if (err) {
+                            node.error("Failed to create pull point subscription: " + err);
+                            return;
+                            }
+
                             node.subscription = subscription;
                             node.stopPulling = false;
-                            node.errorCount = 0; // For exponential backoff
-                            
-                            // Overwrite the device status text
-                            node.status({fill:"green",shape:"dot",text:"listening"}); 
-                            
-                            // DEFINE processEventMessage BEFORE starting polling loop to avoid race condition
-                            node.processEventMessage = function(camMessage) {
-                                try {
-                                    // Defensive null-checks for message shapes
-                                    if (!camMessage || !camMessage.topic || !camMessage.message || 
-                                        !camMessage.message.message || !camMessage.message.message.$) {
-                                        console.log("Received malformed event message, skipping");
-                                        return;
-                                    }
-                                    
-                                    var eventTopic = camMessage.topic._ || camMessage.topic;
-                                    
-                                    // Handle topic as string directly if it's not an object
-                                    if (typeof eventTopic === 'string') {
-                                        // Strip the namespaces from the topic (e.g. tns1:MediaControl/tnsavg:ConfigurationUpdateAudioEncCfg)
-                                        // Split on '/', then remove any namespace for each part, and at the end recombine parts that were split with '/'
-                                        let parts = eventTopic.split('/');
-                                        eventTopic = "";
-                                        for (var index = 0; index < parts.length; index++) {
-                                            var stringNoNamespace = parts[index].split(':').pop();
-                                            if (eventTopic.length == 0) {
-                                                eventTopic += stringNoNamespace;
-                                            } else {
-                                                eventTopic += '/' + stringNoNamespace;
-                                            }
-                                        }
-                                    }
+                            node.errorCount = 0;
 
-                                    var outputMsg = {
-                                        topic: eventTopic,
-                                        time: camMessage.message.message.$.UtcTime,
-                                        property: camMessage.message.message.$.PropertyOperation // Initialized, Deleted or Changed but missing/undefined on the Avigilon 4 channel encoder
-                                    };
+                            // pick a working pull function (sub vs cam) for onvif@0.6.9 compatibility
+                            const pullFn =
+                            (subscription && typeof subscription.pullMessages === "function" && subscription.pullMessages.bind(subscription)) ||
+                            (subscription && typeof subscription.PullMessages === "function" && subscription.PullMessages.bind(subscription)) ||
+                            (node.deviceConfig.cam && typeof node.deviceConfig.cam.pullMessages === "function" && node.deviceConfig.cam.pullMessages.bind(node.deviceConfig.cam));
 
-                                    // Only handle simpleItem
-                                    // Only handle one 'source' item
-                                    // Ignore the 'key' item  (nothing I own produces it)
-                                    // Handle all the 'Data' items
-
-                                    // SOURCE (Name:Value)
-                                    if (camMessage.message.message.source && camMessage.message.message.source.simpleItem) {
-                                        if (Array.isArray(camMessage.message.message.source.simpleItem)) {
-                                            // TODO : currently we only process the first event source item ...
-                                            outputMsg.source = {
-                                                name:  camMessage.message.message.source.simpleItem[0].$.Name,
-                                                value: camMessage.message.message.source.simpleItem[0].$.Value
-                                            }
-                                        }
-                                        else {
-                                            outputMsg.source = {
-                                                name: camMessage.message.message.source.simpleItem.$.Name,
-                                                value: camMessage.message.message.source.simpleItem.$.Value
-                                            }
-                                        }
-                                    }
-                                    
-                                    //KEY
-                                    if (camMessage.message.message.key) {
-                                        outputMsg.key = camMessage.message.message.key;
-                                    }
-
-                                    // DATA (Name:Value)
-                                    if (camMessage.message.message.data && camMessage.message.message.data.simpleItem) {
-                                        if (Array.isArray(camMessage.message.message.data.simpleItem)) {
-                                            outputMsg.data = [];
-                                            for (var x  = 0; x < camMessage.message.message.data.simpleItem.length; x++) {
-                                                outputMsg.data.push({
-                                                    name: camMessage.message.message.data.simpleItem[x].$.Name,
-                                                    value: camMessage.message.message.data.simpleItem[x].$.Value
-                                                })
-                                            }
-                                        }
-                                        else {
-                                            outputMsg.data = {
-                                                name: camMessage.message.message.data.simpleItem.$.Name,
-                                                value: camMessage.message.message.data.simpleItem.$.Value
-                                            }
-                                        }
-                                    }
-                                    else if (camMessage.message.message.data && camMessage.message.message.data.elementItem) {
-                                        outputMsg.data = {
-                                            dataName: 'elementItem',
-                                            dataValue: JSON.stringify(camMessage.message.message.data.elementItem)
-                                        }
-                                    }
-
-                                    // As soon as we get an event from the camera, we will send it to the output of this node
-                                    node.send(outputMsg);
-                                } catch (err) {
-                                    console.log("Error processing event message: " + err);
-                                }
-                            };
-                            
-                            // Function to actively pull messages from the camera
-                            var pullMessages = function() {
-                                if (!node.subscription || node.stopPulling) {
-                                    return;
-                                }
-                                
-                                // Pull messages with 1 second timeout and max 100 messages
-                                node.subscription.pullMessages({
-                                    timeout: 'PT1S',
-                                    messageLimit: 100
-                                }, function(err, result) {
-                                    if (err) {
-                                        // Only log error if not stopped intentionally
-                                        if (!node.stopPulling) {
-                                            node.errorCount = (node.errorCount || 0) + 1;
-                                            console.log("Error pulling messages (attempt " + node.errorCount + "): " + err);
-                                            
-                                            // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
-                                            var backoffDelay = Math.min(1000 * Math.pow(2, node.errorCount - 1), 30000);
-                                            setTimeout(pullMessages, backoffDelay);
-                                        }
-                                        return;
-                                    }
-                                    
-                                    // Reset error count on success
-                                    node.errorCount = 0;
-                                    
-                                    // Process notification messages
-                                    if (result && result.notificationMessage) {
-                                        var messages = Array.isArray(result.notificationMessage) 
-                                            ? result.notificationMessage 
-                                            : [result.notificationMessage];
-                                        
-                                        messages.forEach(function(notifMsg) {
-                                            // Convert notification message to the expected format
-                                            var camMessage = {
-                                                topic: notifMsg.topic,
-                                                message: notifMsg.message
-                                            };
-                                            
-                                            // Process using the event handler logic
-                                            if (node.processEventMessage) {
-                                                node.processEventMessage(camMessage);
-                                            }
-                                        });
-                                    }
-                                    
-                                    // Continue polling
-                                    if (!node.stopPulling) {
-                                        setImmediate(pullMessages);
-                                    }
-                                });
-                            };
-                            
-                            // Call SetSynchronizationPoint to get current property states (critical for Tapo cameras)
-                            if (node.subscription.setSynchronizationPoint) {
-                                node.subscription.setSynchronizationPoint(function(err) {
-                                    if (err) {
-                                        console.log("Note: setSynchronizationPoint returned: " + err);
-                                    }
-                                    // Start polling regardless of sync result
-                                    pullMessages();
-                                });
-                            } else {
-                                // Start polling immediately if sync not supported
-                                pullMessages();
+                            if (!pullFn) {
+                            node.error("PullPoint has no pullMessages/PullMessages and cam has no pullMessages. Check onvif version.");
+                            return;
                             }
-                            
-                            // Set up subscription renewal to prevent expiry (every 60 seconds)
-                            const RENEW_INTERVAL_MS = 60 * 1000;
-                            node.renewalTimer = setInterval(function() {
-                                if (node.subscription && node.subscription.renew) {
-                                    node.subscription.renew(function(err) {
-                                        if (err) {
-                                            console.log("Error renewing subscription: " + err);
-                                        }
-                                    });
+
+                            // Set sync point if available (on sub or cam, varies by lib)
+                            const setSync =
+                            (subscription && typeof subscription.setSynchronizationPoint === "function" && subscription.setSynchronizationPoint.bind(subscription)) ||
+                            (node.deviceConfig.cam && typeof node.deviceConfig.cam.setSynchronizationPoint === "function" && node.deviceConfig.cam.setSynchronizationPoint.bind(node.deviceConfig.cam));
+
+                            if (setSync) {
+                            try { setSync(() => {}); } catch (e) { /* ignore */ }
+                            }
+
+                            node.status({ fill: "green", shape: "dot", text: "listening (pull)" });
+                            node.warn("PullPoint ready — using " + (pullFn === node.deviceConfig.cam.pullMessages ? "cam.pullMessages" : "subscription.pullMessages"));
+
+                            // single poll loop with exponential backoff
+                            function poll() {
+                            if (node.stopPulling) return;
+
+                            pullFn({ timeout: "PT1S", messageLimit: 100 }, function (err, res) {
+                                if (err) {
+                                node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
+                                const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
+                                if (!node.stopPulling) setTimeout(poll, backoff);
+                                return;
                                 }
-                            }, RENEW_INTERVAL_MS);
+                                node.errorCount = 0;
+
+                                const list = res && res.notificationMessage
+                                ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
+                                : [];
+
+                                for (const n of list) {
+                                const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
+                                if (node.processEventMessage) node.processEventMessage(camMessage);
+                                }
+
+                                if (!node.stopPulling) setTimeout(poll, 0);
+                            });
+                            }
+
+                            // renew timer (some stacks expose renew on sub; fine to skip if absent)
+                            if (subscription && typeof subscription.renew === "function") {
+                            node.renewalTimer = setInterval(() => {
+                                if (!node.stopPulling) subscription.renew(() => {});
+                            }, 60000);
+                            }
+
+                            poll();
                         });
+
                         break;
                     case "stop":
                         if (!node.subscription) {
