@@ -15,6 +15,8 @@ module.exports = function (RED) {
   function OnvifEventsNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
+    const onvif = require('onvif');
+    const { URL } = require('url');
 
     // ---- Config / options (add to .html later if you want GUI toggles) ----
     node.deviceConfig = RED.nodes.getNode(config.config);
@@ -41,6 +43,32 @@ module.exports = function (RED) {
     node._seenTTL = new Map();   // hash => timestamp(ms)
 
     // ---- Helpers ----
+    async function makeLocalCamFromConfig(cfgNode) {
+    if (!cfgNode || !cfgNode.xaddress) return null;
+    try {
+        const u = new URL(cfgNode.xaddress); // e.g. http://CAM_IP:2020/onvif/device_service
+        const opts = {
+        hostname: u.hostname,
+        port: u.port ? Number(u.port) : 80,
+        username: cfgNode.user || cfgNode.username,
+        password: cfgNode.pass || cfgNode.password,
+        path: u.pathname, // "/onvif/device_service"
+        timeout: 5000
+        };
+        return await new Promise((resolve, reject) => {
+        // onvif@0.6.x Cam ctor is callback-based
+        // eslint-disable-next-line no-new
+        new onvif.Cam(opts, function (err) {
+            if (err) return reject(err);
+            resolve(this); // 'this' is the Cam instance
+        });
+        });
+    } catch (e) {
+        node.warn("makeLocalCamFromConfig error: " + e.message);
+        return null;
+    }
+    }
+
     function pruneTTL(now) {
       for (const [k, t] of node._seenTTL) {
         if (now - t > 10_000) node._seenTTL.delete(k); // 10s TTL
@@ -144,29 +172,38 @@ module.exports = function (RED) {
     };
 
     // ---- Start (PullPoint) ----
-    function startListening() {
-    if (started) return; // idempotent
+    async function startListening() {
+    if (started) return;
 
+    // Re-resolve config node each attempt
+    const cfgId = (config && (config.config || config.deviceConfig || config.camera || config.cam)) || null;
+    node.deviceConfig = cfgId ? RED.nodes.getNode(cfgId) : null;
 
-    // Camera instance not ready yet? show status and retry in 1s
-    // 🔧 Re-fetch the config node each attempt (it may not have been ready earlier)
-    node.deviceConfig = RED.nodes.getNode(config.config);
+    // Get a Cam instance: prefer config.cam; else build a local one
+    let cam = node.deviceConfig && node.deviceConfig.cam;
+    if (!cam && node.deviceConfig) {
+        node.status({ fill: "yellow", shape: "ring", text: "connecting (own cam)" });
+        try {
+        cam = await makeLocalCamFromConfig(node.deviceConfig);
+        } catch (e) {
+        // ignore; cam stays null
+        }
+    }
 
-    if (!node.deviceConfig || !node.deviceConfig.cam) {
-        node.status({ fill: "yellow", shape: "ring", text: "waiting for camera" });
-        // (optional) throttle this log if it's too chatty
+    if (!cam) {
+        node.status({ fill: "yellow", shape: "ring", text: node.deviceConfig ? "waiting for camera" : "no camera configured" });
+        // throttle noisy log
         node._lastWaitLog = node._lastWaitLog || 0;
         const now = Date.now();
         if (now - node._lastWaitLog > 5000) {
-        node.warn("onvif-events: deviceConfig=" + !!node.deviceConfig + " cam=" + (node.deviceConfig && !!node.deviceConfig.cam));
+        node.warn(`onvif-events: cfgId=${cfgId || 'NONE'} deviceConfig=${!!node.deviceConfig} cam=${false}`);
         node._lastWaitLog = now;
         }
-        // try again shortly; don't rely only on the 10s global loop
         setTimeout(() => { if (!started) startListening(); }, 1000);
         return;
     }
 
-    // This build only implements PullPoint
+    // we have a cam — continue as before
     if (node.subscriptionMode !== "pull") {
         node.status({ fill: "red", shape: "ring", text: "only pull mode supported in this build" });
         return;
@@ -175,8 +212,8 @@ module.exports = function (RED) {
     started = true;
     node.stopPulling = false;
 
-    // Create PullPoint subscription
-    node.deviceConfig.cam.createPullPointSubscription(function (err, subscription /*, terminationTime */) {
+    // Use THIS cam for all calls below (not node.deviceConfig.cam)
+    cam.createPullPointSubscription((err, subscription /*, term */) => {
         if (err) {
         started = false;
         node.status({ fill: "red", shape: "ring", text: ("pullpoint failed: " + String(err)).slice(0, 60) });
@@ -186,11 +223,11 @@ module.exports = function (RED) {
         node.subscription = subscription;
         node.errorCount = 0;
 
-        // Pick a working pullMessages (subscription or cam) for onvif@0.6.x
+        // Feature-detect pullMessages on subscription OR cam
         const pullFn =
         (subscription && typeof subscription.pullMessages === "function" && subscription.pullMessages.bind(subscription)) ||
         (subscription && typeof subscription.PullMessages === "function" && subscription.PullMessages.bind(subscription)) ||
-        (node.deviceConfig.cam && typeof node.deviceConfig.cam.pullMessages === "function" && node.deviceConfig.cam.pullMessages.bind(node.deviceConfig.cam));
+        (typeof cam.pullMessages === "function" && cam.pullMessages.bind(cam));
 
         if (!pullFn) {
         started = false;
@@ -198,28 +235,26 @@ module.exports = function (RED) {
         return;
         }
 
-        // Optional sync point (on sub or cam)
+        // Optional sync point (sub or cam)
         if (node.enableSyncPoint) {
         const setSync =
             (subscription && typeof subscription.setSynchronizationPoint === "function" && subscription.setSynchronizationPoint.bind(subscription)) ||
-            (node.deviceConfig.cam && typeof node.deviceConfig.cam.setSynchronizationPoint === "function" && node.deviceConfig.cam.setSynchronizationPoint.bind(node.deviceConfig.cam));
+            (typeof cam.setSynchronizationPoint === "function" && cam.setSynchronizationPoint.bind(cam));
         try { setSync && setSync(() => {}); } catch (e) {}
         }
 
         node.status({ fill: "green", shape: "dot", text: "listening (pull)" });
 
-        // Auto-renew (if supported)
+        // Auto-renew if available
         if (node.enableAutoRenew && subscription && typeof subscription.renew === "function") {
-        node.renewalTimer = setInterval(() => {
-            if (!node.stopPulling) { try { subscription.renew(() => {}); } catch (e) {} }
-        }, 60_000);
+        node.renewalTimer = setInterval(() => { if (!node.stopPulling) try { subscription.renew(() => {}); } catch (e) {} }, 60000);
         }
 
-        // Poll loop with gentle pacing + exponential backoff on error
+        // Poll loop with gentle pacing + backoff (unchanged from your last version)
         function poll() {
         if (node.stopPulling) return;
 
-        pullFn({ timeout: node.pullTimeout, messageLimit: node.pullLimit }, function (err, res) {
+        pullFn({ timeout: node.pullTimeout, messageLimit: node.pullLimit }, (err, res) => {
             if (err) {
             node.errorCount = Math.min(node.errorCount + 1, 10);
             const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
@@ -236,7 +271,7 @@ module.exports = function (RED) {
             node.processEventMessage && node.processEventMessage(camMessage);
             }
 
-            const delay = list.length ? node.gentleDelayWithMsgs : node.gentleDelayNoMsgs; // e.g. 50/250ms
+            const delay = list.length ? node.gentleDelayWithMsgs : node.gentleDelayNoMsgs; // e.g., 50/250ms
             setTimeout(poll, delay);
         });
         }
@@ -244,61 +279,61 @@ module.exports = function (RED) {
         poll();
     });
     }
+// ---- Input API (backward compatible) ----
+node.on("input", (msg) => {
+  const action = (msg && msg.action) || (msg && msg.payload && msg.payload.action);
+  switch (action) {
+    case "start": startListening(); break;
+    case "stop":  stopListening();  break;
 
-    // ---- Input API (backward compatible) ----
-    node.on("input", (msg) => {
-      const action = (msg && msg.action) || (msg && msg.payload && msg.payload.action);
-      switch (action) {
-        case "start":
-          startListening();
-          break;
-        case "stop":
-          stopListening();
-          break;
+    case "getEventProperties":
+      if (!node.deviceConfig) return;
+      (async () => {
+        // prefer the existing cam if present; otherwise build one quickly
+        const cam =
+          (node.deviceConfig && node.deviceConfig.cam) ||
+          (await makeLocalCamFromConfig(node.deviceConfig));
+        if (!cam) return node.error("getEventProperties: no camera");
+        cam.getEventProperties((err, tree /*, xml */) => {
+          if (err) return node.error("getEventProperties failed: " + err);
+          node.send({ topic: "getEventProperties", payload: tree });
+        });
+      })();
+      break;
 
-        case "getEventProperties":
-          if (!node.deviceConfig || !node.deviceConfig.cam) return;
-          node.deviceConfig.cam.getEventProperties(function (err, tree /*, xml */) {
-            if (err) return node.error("getEventProperties failed: " + err);
-            // Minimal passthrough (you can simplify further if you used utils previously)
-            node.send({ topic: "getEventProperties", payload: tree });
-          });
-          break;
-
-        case "getEventServiceCapabilities":
-          if (!node.deviceConfig || !node.deviceConfig.cam) return;
-          node.deviceConfig.cam.getEventServiceCapabilities(function (err, caps /*, xml */) {
-            if (err) return node.error("getEventServiceCapabilities failed: " + err);
-            node.send({ topic: "getEventServiceCapabilities", payload: caps });
-          });
-          break;
-
-        default:
-          // ignore
-          break;
-      }
-    });
-
-    // ---- Auto-start + auto-retry (no Inject node needed) ----
-    if (node.autoStart) {
-        setTimeout(() => startListening(), 500);
-        autoRetryTimer = setInterval(() => {
-            // 🔧 refresh the config node before attempting again
-            node.deviceConfig = RED.nodes.getNode(config.config);
-            if (!started) startListening();
-        }, node.autoRetryMs);
-    }
-
-    // ---- Clean up ----
-    node.on("close", (removed, done) => {
-      if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
-      stopListening();
-      done && done();
-    });
-
-    // Initial status
-    node.status({ fill: "grey", shape: "ring", text: "idle" });
+    case "getEventServiceCapabilities":
+      if (!node.deviceConfig) return;
+      (async () => {
+        const cam =
+          (node.deviceConfig && node.deviceConfig.cam) ||
+          (await makeLocalCamFromConfig(node.deviceConfig));
+        if (!cam) return node.error("getEventServiceCapabilities: no camera");
+        cam.getEventServiceCapabilities((err, caps /*, xml */) => {
+          if (err) return node.error("getEventServiceCapabilities failed: " + err);
+          node.send({ topic: "getEventServiceCapabilities", payload: caps });
+        });
+      })();
+      break;
   }
+});
+
+// ---- Auto-start + auto-retry (no Inject needed) ----
+if (node.autoStart) {
+  setTimeout(() => startListening(), 500); // try once after deploy
+  autoRetryTimer = setInterval(() => {     // keep trying until it sticks
+    if (!started) startListening();
+  }, node.autoRetryMs);
+}
+
+// ---- Clean up ----
+node.on("close", (removed, done) => {
+  if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
+  stopListening();
+  done && done();
+});
+
+// Initial status
+node.status({ fill: "grey", shape: "ring", text: "idle" });
 
   RED.nodes.registerType("onvif-events", OnvifEventsNode);
 };
