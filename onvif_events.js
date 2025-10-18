@@ -225,16 +225,6 @@
                                             errStr.includes("terminated") ||
                                             errStr.includes("expired");
                                         
-                                        // Network errors that indicate subscription is dead (C560 specific)
-                                        const isNetworkError =
-                                            errStr.includes("socket hang up") ||
-                                            errStr.includes("econnreset") ||
-                                            errStr.includes("etimedout") ||
-                                            errStr.includes("econnrefused") ||
-                                            errCode === "ECONNRESET" ||
-                                            errCode === "ETIMEDOUT" ||
-                                            errCode === "ECONNREFUSED";
-                                        
                                         if (isSubscriptionError) {
                                             node.warn("Subscription error detected: " + err);
                                             if (!node.stopPulling) {
@@ -245,16 +235,41 @@
                                         
                                         // Track consecutive errors
                                         node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
-                                        const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
-                                        node.warn("Poll error (attempt " + node.errorCount + "): " + err);
                                         
-                                        // Network errors or 3+ consecutive failures = recreate subscription (C560 needs faster recovery)
-                                        if ((isNetworkError || node.errorCount >= 3) && !node.stopPulling) {
-                                            node.warn("Network/repeated error detected - recreating subscription");
+                                        // C560 specific: socket hang up happens regularly every ~10 seconds
+                                        // Don't recreate immediately - just retry with short delay
+                                        const isSocketHangup = errStr.includes("socket hang up");
+                                        
+                                        if (isSocketHangup) {
+                                            // For socket hang up (C560 pattern), use minimal delay and don't recreate unless persistent
+                                            if (node.errorCount >= 5) {
+                                                node.warn("Persistent socket hang ups - recreating subscription");
+                                                recreateSubscription();
+                                                return;
+                                            }
+                                            // Short delay for socket hang up, then retry
+                                            if (!node.stopPulling) setTimeout(poll, 500);
+                                            return;
+                                        }
+                                        
+                                        // Other network errors
+                                        const isNetworkError =
+                                            errStr.includes("econnreset") ||
+                                            errStr.includes("etimedout") ||
+                                            errStr.includes("econnrefused") ||
+                                            errCode === "ECONNRESET" ||
+                                            errCode === "ETIMEDOUT" ||
+                                            errCode === "ECONNREFUSED";
+                                        
+                                        if (isNetworkError && node.errorCount >= 3) {
+                                            node.warn("Network error - recreating subscription");
                                             recreateSubscription();
                                             return;
                                         }
                                         
+                                        // General errors - exponential backoff
+                                        const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
+                                        node.warn("Poll error (attempt " + node.errorCount + "): " + err);
                                         if (!node.stopPulling) setTimeout(poll, backoff);
                                         return;
                                     }
