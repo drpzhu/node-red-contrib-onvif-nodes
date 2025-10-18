@@ -56,28 +56,58 @@ module.exports = function (RED) {
 
     // ---- (Optional) build a local Cam if config.cam isn’t ready ----
     async function makeLocalCamFromConfig(cfgNode) {
-      if (!cfgNode || !cfgNode.xaddress) return null;
-      try {
-        const u = new URL(cfgNode.xaddress); // e.g., http://IP:2020/onvif/device_service
-        const opts = {
-          hostname: u.hostname,
-          port: u.port ? Number(u.port) : 80,
-          username: cfgNode.user || cfgNode.username,
-          password: cfgNode.pass || cfgNode.password,
-          path: u.pathname,
-          timeout: 5000
-        };
-        return await new Promise((resolve, reject) => {
-          // eslint-disable-next-line no-new
-          new onvif.Cam(opts, function (err) {
-            if (err) return reject(err);
-            resolve(this); // 'this' is the Cam instance
-          });
-        });
-      } catch (e) {
-        node.warn("makeLocalCamFromConfig error: " + e.message);
+    if (!cfgNode) return null;
+
+    // Prefer xaddress, but tolerate bare host:port or just host
+    let raw = (cfgNode.xaddress || "").trim();
+    if (!raw) {
+        // try separate fields some configs use
+        const host = (cfgNode.host || cfgNode.hostname || "").trim();
+        const port = (cfgNode.port || "").toString().trim();
+        if (!host) return null;
+        raw = host + (port ? (":" + port) : "");
+    }
+
+    // Add scheme if missing
+    if (!/^https?:\/\//i.test(raw)) raw = "http://" + raw;
+
+    // Ensure path
+    if (/^https?:\/\/[^/]+\/?$/i.test(raw)) {
+        // no path -> default ONVIF device service path
+        if (!raw.endsWith("/")) raw += "/";
+        raw += "onvif/device_service";
+    }
+
+    let u;
+    try {
+        u = new URL(raw);
+    } catch (e) {
+        node.warn("makeLocalCamFromConfig error (normalize): " + e.message + " | raw=" + raw);
         return null;
-      }
+    }
+
+    // Default port: if none given, use 2020 (Tapo); otherwise use provided
+    const portNum = u.port ? Number(u.port) : 2020;
+
+    const opts = {
+        hostname: u.hostname,
+        port: portNum,
+        username: cfgNode.user || cfgNode.username,
+        password: cfgNode.pass || cfgNode.password,
+        path: u.pathname || "/onvif/device_service",
+        timeout: 5000
+    };
+
+    // Breadcrumb to confirm what we’re dialing (password omitted)
+    node.status({ fill: "yellow", shape: "ring", text: `connecting ${opts.hostname}:${opts.port}${opts.path}` });
+
+    return await new Promise((resolve, reject) => {
+        // eslint-disable-next-line no-new
+        new (require("onvif").Cam)(opts, function (err) {
+        if (err) return reject(err);
+        resolve(this); // 'this' is the Cam instance
+        });
+    });
     }
 
     // ---- Normalize + de-dup outgoing events ----
