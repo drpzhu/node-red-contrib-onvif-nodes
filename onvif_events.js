@@ -157,6 +157,8 @@
                             node.subscription = subscription;
                             node.stopPulling = false;
                             node.errorCount = 0;
+                            node.isPolling = false; // Track if poll is already running
+                            node.recentEvents = new Map(); // For deduplication
 
                             // pick a working pull function (sub vs cam) for onvif@0.6.9 compatibility
                             const pullFn =
@@ -209,9 +211,12 @@
                             
                             // single poll loop with exponential backoff and subscription recreation
                             function poll() {
-                                if (node.stopPulling) return;
+                                if (node.stopPulling || node.isPolling) return;
+                                node.isPolling = true;
 
                                 pullFn({ timeout: "PT1S", messageLimit: 100 }, function (err, res) {
+                                    node.isPolling = false;
+                                    
                                     if (err) {
                                         // Check if this is a subscription/network error that requires recreation
                                         const errStr = (err.message || err.toString()).toLowerCase();
@@ -280,8 +285,35 @@
                                         ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
                                         : [];
 
+                                    // Deduplicate events based on topic+time (C560 sends many duplicates)
                                     for (const n of list) {
                                         const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
+                                        
+                                        // Create unique key from topic and time
+                                        const mm = camMessage.message && camMessage.message.message;
+                                        if (mm && mm.$) {
+                                            const eventKey = (n.topic || n.Topic) + '|' + mm.$.UtcTime;
+                                            const now = Date.now();
+                                            
+                                            // Check if we've seen this event in last 2 seconds
+                                            if (node.recentEvents.has(eventKey)) {
+                                                const lastSeen = node.recentEvents.get(eventKey);
+                                                if (now - lastSeen < 2000) {
+                                                    continue; // Skip duplicate
+                                                }
+                                            }
+                                            
+                                            // Record this event
+                                            node.recentEvents.set(eventKey, now);
+                                            
+                                            // Clean old entries (older than 5 seconds)
+                                            for (const [key, timestamp] of node.recentEvents.entries()) {
+                                                if (now - timestamp > 5000) {
+                                                    node.recentEvents.delete(key);
+                                                }
+                                            }
+                                        }
+                                        
                                         if (node.processEventMessage) node.processEventMessage(camMessage);
                                     }
 
