@@ -180,37 +180,97 @@
                             node.status({ fill: "green", shape: "dot", text: "listening (pull)" });
                             node.warn("PullPoint ready — using " + (pullFn === node.deviceConfig.cam.pullMessages ? "cam.pullMessages" : "subscription.pullMessages"));
 
-                            // single poll loop with exponential backoff
+                            // Helper to recreate subscription (for C560 and other cameras with short timeouts)
+                            function recreateSubscription() {
+                                node.warn("Subscription expired or lost - recreating...");
+                                node.status({ fill: "yellow", shape: "ring", text: "reconnecting..." });
+                                
+                                // Clear old subscription
+                                if (node.subscription && node.subscription.unsubscribe) {
+                                    try {
+                                        node.subscription.unsubscribe(() => {});
+                                    } catch (e) { /* ignore */ }
+                                }
+                                if (node.renewalTimer) {
+                                    clearInterval(node.renewalTimer);
+                                    node.renewalTimer = null;
+                                }
+                                
+                                // Recreate after brief delay
+                                setTimeout(() => {
+                                    if (node.stopPulling) return;
+                                    
+                                    // Trigger a new "start" by re-injecting the message
+                                    node.subscription = null;
+                                    node.receive({ action: "start" });
+                                }, 2000);
+                            }
+                            
+                            // single poll loop with exponential backoff and subscription recreation
                             function poll() {
-                            if (node.stopPulling) return;
+                                if (node.stopPulling) return;
 
-                            pullFn({ timeout: "PT1S", messageLimit: 100 }, function (err, res) {
-                                if (err) {
-                                node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
-                                const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
-                                if (!node.stopPulling) setTimeout(poll, backoff);
-                                return;
-                                }
-                                node.errorCount = 0;
+                                pullFn({ timeout: "PT1S", messageLimit: 100 }, function (err, res) {
+                                    if (err) {
+                                        // Check if this is a subscription expiry error
+                                        const errStr = (err.message || err.toString()).toLowerCase();
+                                        const isSubscriptionError = 
+                                            errStr.includes("subscription") ||
+                                            errStr.includes("pullmessages") ||
+                                            errStr.includes("invalid args") ||
+                                            errStr.includes("not found") ||
+                                            errStr.includes("terminated") ||
+                                            errStr.includes("expired");
+                                        
+                                        if (isSubscriptionError) {
+                                            node.warn("Subscription error detected: " + err);
+                                            if (!node.stopPulling) {
+                                                recreateSubscription();
+                                            }
+                                            return;
+                                        }
+                                        
+                                        // Regular error - use backoff
+                                        node.errorCount = Math.min((node.errorCount || 0) + 1, 10);
+                                        const backoff = Math.min(1000 * Math.pow(2, node.errorCount - 1), 10000);
+                                        node.warn("Poll error (attempt " + node.errorCount + "): " + err);
+                                        
+                                        // After 5 consecutive failures, try recreating subscription
+                                        if (node.errorCount >= 5 && !node.stopPulling) {
+                                            recreateSubscription();
+                                            return;
+                                        }
+                                        
+                                        if (!node.stopPulling) setTimeout(poll, backoff);
+                                        return;
+                                    }
+                                    
+                                    node.errorCount = 0;
 
-                                const list = res && res.notificationMessage
-                                ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
-                                : [];
+                                    const list = res && res.notificationMessage
+                                        ? (Array.isArray(res.notificationMessage) ? res.notificationMessage : [res.notificationMessage])
+                                        : [];
 
-                                for (const n of list) {
-                                const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
-                                if (node.processEventMessage) node.processEventMessage(camMessage);
-                                }
+                                    for (const n of list) {
+                                        const camMessage = { topic: n.topic || n.Topic, message: n.message || n.Message };
+                                        if (node.processEventMessage) node.processEventMessage(camMessage);
+                                    }
 
-                                if (!node.stopPulling) setTimeout(poll, 0);
-                            });
+                                    if (!node.stopPulling) setTimeout(poll, 0);
+                                });
                             }
 
-                            // renew timer (some stacks expose renew on sub; fine to skip if absent)
+                            // renew timer - more aggressive for C560 (every 30s instead of 60s)
                             if (subscription && typeof subscription.renew === "function") {
-                            node.renewalTimer = setInterval(() => {
-                                if (!node.stopPulling) subscription.renew(() => {});
-                            }, 60000);
+                                node.renewalTimer = setInterval(() => {
+                                    if (!node.stopPulling && node.subscription) {
+                                        subscription.renew((err) => {
+                                            if (err) {
+                                                node.warn("Renewal failed: " + err + " - will recreate if needed");
+                                            }
+                                        });
+                                    }
+                                }, 30000); // 30 seconds for better C560 support
                             }
 
                             poll();
