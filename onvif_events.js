@@ -139,7 +139,8 @@
                                 out.data = { dataName: "elementItem", dataValue: JSON.stringify(mm.data.elementItem) };
                             }
 
-                            node.send(out);
+                            node.send({ topic: out.topic, payload: out });
+
                             } catch (e) {
                             node.warn("processEventMessage error: " + e);
                             }
