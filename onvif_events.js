@@ -147,14 +147,25 @@ module.exports = function (RED) {
     function startListening() {
     if (started) return; // idempotent
 
+
     // Camera instance not ready yet? show status and retry in 1s
+    // 🔧 Re-fetch the config node each attempt (it may not have been ready earlier)
+    node.deviceConfig = RED.nodes.getNode(config.config);
+
     if (!node.deviceConfig || !node.deviceConfig.cam) {
         node.status({ fill: "yellow", shape: "ring", text: "waiting for camera" });
-        // optional breadcrumb
+        // (optional) throttle this log if it's too chatty
+        node._lastWaitLog = node._lastWaitLog || 0;
+        const now = Date.now();
+        if (now - node._lastWaitLog > 5000) {
         node.warn("onvif-events: deviceConfig=" + !!node.deviceConfig + " cam=" + (node.deviceConfig && !!node.deviceConfig.cam));
+        node._lastWaitLog = now;
+        }
+        // try again shortly; don't rely only on the 10s global loop
         setTimeout(() => { if (!started) startListening(); }, 1000);
         return;
     }
+
     // This build only implements PullPoint
     if (node.subscriptionMode !== "pull") {
         node.status({ fill: "red", shape: "ring", text: "only pull mode supported in this build" });
@@ -270,10 +281,12 @@ module.exports = function (RED) {
 
     // ---- Auto-start + auto-retry (no Inject node needed) ----
     if (node.autoStart) {
-      setTimeout(() => startListening(), 500); // try once after deploy
-      autoRetryTimer = setInterval(() => {
-        if (!started) startListening();
-      }, node.autoRetryMs);
+        setTimeout(() => startListening(), 500);
+        autoRetryTimer = setInterval(() => {
+            // 🔧 refresh the config node before attempting again
+            node.deviceConfig = RED.nodes.getNode(config.config);
+            if (!started) startListening();
+        }, node.autoRetryMs);
     }
 
     // ---- Clean up ----
